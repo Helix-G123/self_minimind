@@ -70,3 +70,21 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+
+
+import torch
+import torch.nn as nn
+
+class RMSNorm(nn.Module):
+
+    def __init__(self, dim:int, eps:float=1e-5):
+        super().__init__()
+        self.dim=dim
+        self.eps=eps
+        self.weight=nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x*torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
+    
+    def forward(self, x):
+        return self._norm(x.float())*self.weight.type_as(x)
