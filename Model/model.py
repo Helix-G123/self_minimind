@@ -74,6 +74,7 @@ class MiniMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import math
 
 class RMSNorm(nn.Module):
 
@@ -88,3 +89,48 @@ class RMSNorm(nn.Module):
     
     def forward(self, x):
         return self._norm(x.float())*self.weight.type_as(x)
+
+
+
+def precompute_freqs_cis(dim:int, end:int=int(32*1024),rope_base:float=1e6, rope_scaling:Optional[dict]=None):
+    #RoPE
+    
+    freqs=1.0/(rope_base**((torch.arange(0, dim, 2, dtype=torch.float32))/dim))
+
+    if rope_scaling:
+        orig_max, factor, beta_fast, beta_slow=(
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 4),
+            rope_scaling.get("beta_fast", 4),
+            rope_scaling.get("beta_slow", 1.0)
+        )
+        if end/orig_max>1.0:
+        #计算corr_dim
+            corr_dim=next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max),dim//2)
+
+        #计算power
+            power=torch.arange(0, dim//2, device=freqs.device, dtype=torch.float32)/max(dim//2-1, 1)
+        #计算beta
+            beta=beta_slow+(beta_fast-beta_slow)*power
+
+        #计算scale
+            scale=torch.where(
+                torch.arange(0, dim//2, device=freqs.device)<corr_dim,
+                (beta*factor-beta+1)/(beta*factor),
+                1.0/factor
+            )
+        #应用scale
+            freqs=freqs*scale
+    t=torch.arange(end, device=freqs.device)
+    freqs=torch.outer(freqs, t)
+    freqs_cos=torch.cos(freqs).repeat_interleave(2, dim=-1)
+    freqs_sin=torch.sin(freqs).repeat_interleave(2, dim=-1)
+    #返回一个cos和sin
+    return freqs_cos, freqs_sin
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    def rotate_half(x):
+        return torch.cat([-x[...,x.shape[-1]//2:], x[..., :x.shape[-1]//2]], dim=-1)
+    q_embed=(q*cos.unsqueeze(unsqueeze_dim))+rotate_half(q)*sin.unsqueeze(unsqueeze_dim)
+    k_embed=(k*cos.unsqueeze(unsqueeze_dim))+rotate_half(k)*sin.unsqueeze(unsqueeze_dim)
+    return q_embed, k_embed
