@@ -77,6 +77,7 @@ import torch.nn as nn
 import math
 from typing import Optional, Tuple, List, Union
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
 
 class RMSNorm(nn.Module):
 
@@ -208,3 +209,17 @@ class Attention(nn.Module):
         output=output.transpose(1,2).reshape(batch_size, seq_len, -1)
         output=self.resid_dropout(self.o_proj(output))
         return output, paste_key_value
+class FeedForward(nn.Module):
+    def __init__(self, config:MiniMindConfig):
+        super.__init__()
+        if config.intermediate_size is None:
+            intermediate_size = int((config.hidden_size * 8 / 3))
+            config.intermediate_size=64*((config.intermediate_size+64 - 1)// 64)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        return self.dropout(self.up_proj(self.act_fn(self.gate_proj(x)) * self.down_proj(x)))
