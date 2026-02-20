@@ -75,6 +75,8 @@ class MiniMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
+from typing import Optional, Tuple, List, Union
+import torch.nn.functional as F
 
 class RMSNorm(nn.Module):
 
@@ -134,3 +136,75 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_embed=(q*cos.unsqueeze(unsqueeze_dim))+rotate_half(q)*sin.unsqueeze(unsqueeze_dim)
     k_embed=(k*cos.unsqueeze(unsqueeze_dim))+rotate_half(k)*sin.unsqueeze(unsqueeze_dim)
     return q_embed, k_embed
+
+def repeat_kv(x:torch.Tensor, n_rep:int) -> torch.Tensor:
+    batch_size, slen, num_key_value_heads, head_dim=x.shape
+    if n_rep==1:
+        return x
+    return (
+        x.unsqueeze(3).expand(batch_size, slen, num_key_value_heads, n_rep, head_dim).reshape(batch_size, slen, num_key_value_heads*n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, args:MiniMindConfig):
+        super().__init__()
+        self.num_key_value_heads=args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        assert args.num_attention_heads % args.num_key_value_heads==0
+        self.n_local_head=args.num_attention_heads
+        self.n_local_kv_heads=self.num_key_value_heads
+        self.n_rep=self.n_local_head//self.n_local_kv_heads
+        self.head_dim=args.hidden_size//args.num_attention_heads
+        self.q_proj=nn.Linear(args.hidden_size, self.head_dim * args.num_attention_heads, bias=False)
+        self.k_proj=nn.Linear(args.hidden_size, self.head_dim * args.num_attention_heads, bias=False)
+        self.v_proj=nn.Linear(args.hidden_size, self.head_dim * args.num_attention_heads, bias=False)
+        self.o_proj=nn.Linear(self.head_dim * args.num_attention_heads, args.hidden_size, bias=False)
+        self.attn_dropout=nn.Dropout(args.dropout)
+        self.resid_dropout=nn.Dropout(args.dropout)
+        self.dropout=args.dropout
+        self.flash=hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attn
+
+    def forward(self,
+                x: torch.Tensor,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+                paste_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache=False,
+                attention_mask: Optional[torch.Tensor] = None
+                ):
+        batch_size, seq_len=x.shape
+        xq, xk, xv=self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq=xq.reshape(batch_size, seq_len, self.n_local_head, self.head_dim)
+        xk=xk.reshape(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv=xv.reshape(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        cos, sin=position_embeddings
+        xq, xk=apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        if paste_key_value:
+            xk=torch.cat([paste_key_value[0], xk], dim=1)
+            xv=torch.cat([paste_key_value[1], xv], dim=1)
+        paste_key_value=[xk, xv] if use_cache else None
+
+        xq, xk, xv=(
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2)
+        )
+
+        if self.flash and (seq_len>1) and (paste_key_value is None) and (attention_mask is None or torch.all(attention_mask==1)):
+            output=F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            scores=(xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
+
+            if attention_mask:
+                extended_attention_mask=attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask=(1.0-extended_attention_mask)* -1e9
+                scores=scores+extended_attention_mask
+
+            scores=F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores=self.attn_dropout(scores)
+            scores=scores @ xv
+        
+        output=output.transpose(1,2).reshape(batch_size, seq_len, -1)
+        output=self.resid_dropout(self.o_proj(output))
+        return output, paste_key_value
